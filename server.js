@@ -8,6 +8,7 @@ const server = http.createServer(app);
 const io = new Server(server, { cors: { origin: '*' } });
 app.use((req, res, next) => { res.set('Cache-Control', 'no-store'); next(); });
 app.use(express.static(path.join(__dirname, 'public'), { etag: false, lastModified: false }));
+app.get('/', (req, res) => res.status(500).send('<h2>public/ folder missing on server.</h2><p>GitHub repo mein <b>public</b> folder (index.html, app.js, style.css, sw.js, manifest.json, icon.svg) upload karo, phir Render redeploy hoga.</p>'));
 
 const PORT = process.env.PORT || 3000;
 const rooms = {};
@@ -187,8 +188,8 @@ function saveSeen() { clearTimeout(seenDirty); seenDirty = setTimeout(() => { tr
 const h32 = s => { let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36); };
 function seenOf(tok) { if (!SEEN[tok]) SEEN[tok] = {}; return SEEN[tok]; }
 function mergeSeen(tok, obj) { if (!obj || typeof obj !== 'object') return; const s = seenOf(tok); for (const k of Object.keys(obj)) { if (!s[k]) s[k] = {}; const v = obj[k]; if (v && typeof v === 'object') for (const id of Object.keys(v).slice(0, 400)) s[k][id] = Math.max(s[k][id] || 0, Number(v[id]) || 1); } saveSeen(); }
-function seenCount(room, kind, key) { return room.order.reduce((n, tok) => n + ((SEEN[tok] && SEEN[tok][kind] && SEEN[tok][kind][key]) || 0), 0); }
-function markSeen(room, kind, key) { room.order.forEach(tok => { const s = seenOf(tok); if (!s[kind]) s[kind] = {}; s[kind][key] = (s[kind][key] || 0) + 1; }); saveSeen(); }
+function seenCount(room, kind, key) { return room.order.filter(t => !room.players[t].bot).reduce((n, tok) => n + ((SEEN[tok] && SEEN[tok][kind] && SEEN[tok][kind][key]) || 0), 0); }
+function markSeen(room, kind, key) { room.order.filter(t => !room.players[t].bot).forEach(tok => { const s = seenOf(tok); if (!s[kind]) s[kind] = {}; s[kind][key] = (s[kind][key] || 0) + 1; }); saveSeen(); }
 // pick n items the room's players have seen the least (random among equals)
 function pickFresh(room, kind, list, n, keyFn = x => h32(typeof x === 'string' ? x : x.q)) {
   const scored = shuffle(list).map(x => ({ x, k: keyFn(x), c: seenCount(room, kind, keyFn(x)) })).sort((p, q) => p.c - q.c);
@@ -226,7 +227,7 @@ function viewFor(room, pid) {
   const revealAll = room.phase === 'FINAL' || room.phase === 'SHARE_STEAL';
   const players = room.order.map(id => {
     const p = room.players[id];
-    const v = { id, name: p.name, alive: p.alive, connected: p.connected, ready: p.ready, isHost: id === room.hostId };
+    const v = { id, name: p.name, alive: p.alive, connected: p.connected, ready: p.ready, isHost: id === room.hostId, bot: !!p.bot };
     if (revealAll || id === pid || (isT && p.role === 'traitor') || room.banishedList.find(b => b.id === id && b.revealed)) v.role = p.role;
     if (id === pid) { v.shield = p.shield; }
     return v;
@@ -265,7 +266,124 @@ function push(room) {
     const p = room.players[id];
     if (p.socketId) io.to(p.socketId).emit('state', viewFor(room, id));
   }
+  if (room.hasBots) setImmediate(() => { try { botTick(room); } catch (e) { console.error('bot', e); } });
 }
+function doReady(r, pid) { if (r.phase !== 'ROLES') return; const p = r.players[pid]; if (!p) return; p.ready = true; if (allReady(r)) startMission(r); else push(r); }
+function doEndChoice(r, pid, v) { if (r.phase !== 'END_CHOICE') return; const p = r.players[pid]; if (!p || !p.alive) return; r.pd.votes[pid] = v === 'end' ? 'end' : 'more'; if (Object.keys(r.pd.votes).length >= alive(r).length) resolveEndChoice(r); else push(r); }
+function doShareSteal(r, pid, c) { if (r.phase !== 'SHARE_STEAL') return; if (!r.pd.traitorIds.includes(pid)) return; if (r.pd.choices[pid]) return; r.pd.choices[pid] = c === 'steal' ? 'steal' : 'share'; if (Object.keys(r.pd.choices).length >= r.pd.traitorIds.length) finalize(r); else push(r); }
+
+// ---------- computer players ----------
+const BOT_NAMES = ['Vikram', 'Meera', 'Arjun', 'Kabir', 'Zoya', 'Dev', 'Tara', 'Rehan', 'Ishaan', 'Naina'];
+const BOT_REASONS = ['mission mein bahut chup tha', 'vote pattern ajeeb lag raha hai', 'zaroorat se zyada defend kar raha hai', 'gut feeling', 'kal galat bande ko vote diya tha', 'aankhein bata rahi hain', 'sabse zyada confident — wahi shak hai', 'chat mein sabko ghuma raha tha', 'bahut innocent ban raha hai', 'Breakfast pe khush lag raha tha'];
+const BOT_TABLE = ['Mujhe {X} pe shak hai — {R}.', 'Seedhi baat: {X}. {R}.', 'Dekho, kal ka vote yaad karo. {X} ko dhyan se dekho.', 'Main {X} ke naam pe ja raha hoon. {R}.', '{X}, tum kuch zyada hi shaant ho.', 'Mera vote aaj {X} ko. Koi aur naam ho toh batao.'];
+const BOT_DEFEND = ['Main Innocent hoon yaar, mujhe kyu ghaseet rahe ho?', 'Mera naam mat lo — mission mein sabse zyada maine kiya.', 'Achha? Toh phir kal raat mujhe kyu nahi maara Traitors ne... soch lo.', 'Mujhpe waqt barbaad mat karo, asli Traitor has raha hai.'];
+const BOT_TURRET = ['Isko maarte hain — sabse tez dimaag hai.', 'Ye humein pakad lega, aaj raat isko.', 'Shaant wale ko chhodo, jo bol raha hai usko hatao.', 'Theek hai, main agree.'];
+const BOT_PAIR = { fruit: ['aam', 'kela', 'seb'], number: ['3', '2'], color: ['laal', 'neela'], actor: ['shahrukh', 'salman'], city: ['mumbai', 'delhi'], janwar: ['kutta', 'sher'], sabzi: ['aloo', 'bhindi'], mithai: ['gulab jamun', 'rasgulla'], cricketer: ['virat', 'dhoni'], superhero: ['spiderman', 'batman'], mahina: ['january', 'december'], 'fast food': ['pizza', 'burger'], movie: ['3 idiots', 'ddlj'], drink: ['chai', 'coke'], weekday: ['monday', 'sunday'], 'body part': ['haath', 'naak'], vehicle: ['car', 'bike'], phool: ['gulab', 'kamal'], country: ['india', 'america'], app: ['whatsapp', 'instagram'], subject: ['maths', 'science'], tyohaar: ['diwali', 'holi'], 'ice cream': ['vanilla', 'chocolate'], singer: ['arijit', 'shreya'], series: ['mirzapur', 'money heist'], cartoon: ['doraemon', 'tom and jerry'], snack: ['samosa', 'chips'], rajasthan: ['jaipur', 'udaipur'], mausam: ['sardi', 'baarish'], planet: ['mars', 'earth'], topping: ['cheese', 'paneer'], marvel: ['iron man', 'thor'], letter: ['a', 's'], dish: ['dal chawal', 'rajma'], ipl: ['csk', 'mi', 'rr'], car: ['maruti', 'tata'], 'mobile brand': ['samsung', 'iphone'], dance: ['bhangra', 'garba'], 'board game': ['ludo', 'chess'], chai: ['masala', 'adrak'], paneer: ['paneer butter masala', 'palak paneer'] };
+function addBots(room) {
+  const need = Math.max(0, 6 - room.order.length); if (!need) return;
+  const taken = new Set(Object.values(room.players).map(p => p.name.toLowerCase()));
+  const names = shuffle(BOT_NAMES).filter(n => !taken.has(n.toLowerCase())).slice(0, need);
+  names.forEach(n => { const tok = 'bot_' + Math.random().toString(36).slice(2, 8); addPlayer(room, tok, n); room.players[tok].bot = true; room.chat.push({ t: now(), sys: true, text: `🤖 ${n} (computer) palace mein aaye` }); });
+  room.hasBots = true; room.botMind = room.botMind || {}; room.botActed = room.botActed || {};
+  push(room);
+}
+function bots(room) { return room.order.map(id => room.players[id]).filter(p => p.bot); }
+function botDelay(room, key, bot, ms, fn) {
+  const k = bot.id + '|' + key; room.botActed = room.botActed || {}; if (room.botActed[k]) return; room.botActed[k] = true;
+  const ph = room.phase; setTimeout(() => { if (room.phase !== ph) return; try { fn(); } catch (e) { console.error('botact', e); } }, Math.round(ms * TIMESCALE));
+}
+function mind(room, bot) { room.botMind = room.botMind || {}; if (!room.botMind[bot.id]) { const bias = {}; room.order.forEach(id => bias[id] = Math.random() * 1.5); room.botMind[bot.id] = { bias, chatted: 0 }; } return room.botMind[bot.id]; }
+// public suspicion: what the whole table can see
+function pubSus(room) {
+  const s = {}; room.order.forEach(id => s[id] = 0);
+  room.voteHistory.forEach(h => {
+    const bRole = h.banished ? room.players[h.banished].role : null;
+    Object.entries(h.votes).forEach(([voter, target]) => {
+      s[target] = (s[target] || 0) + 1;
+      if (h.banished && target === h.banished) s[voter] += bRole === 'traitor' ? -1.5 : 0.7;
+    });
+  });
+  room.log.filter(l => l.kind === 'banish' && /aakhri shabd/.test(l.text)).forEach(l => {
+    const m = l.text.match(/^(.+?) ke aakhri shabd: 👉 (.+?) par shaq/); if (!m) return;
+    const from = Object.values(room.players).find(p => p.name === m[1]); const to = Object.values(room.players).find(p => p.name === m[2]);
+    if (from && to) s[to.id] += from.role === 'traitor' ? -0.5 : 2;
+  });
+  return s;
+}
+function botSuspect(room, bot, cands) {
+  const s = pubSus(room); const m = mind(room, bot);
+  const pool = cands.filter(p => p.id !== bot.id && (bot.role !== 'traitor' || p.role !== 'traitor'));
+  const use = pool.length ? pool : cands.filter(p => p.id !== bot.id);
+  if (!use.length) return null;
+  const scored = use.map(p => ({ p, v: (s[p.id] || 0) + m.bias[p.id] + (p.role === 'traitor' && bot.role === 'faithful' ? 0.4 : 0) })).sort((x, y) => y.v - x.v);
+  return Math.random() < 0.15 ? rnd(use) : scored[0].p;
+}
+function botSyncAnswer(q) {
+  const ya = q.match(/:\s*(.+?) ya (.+?)\?/) || q.match(/^(.+?) ya (.+?)\?/); if (ya) return Math.random() < 0.6 ? ya[1].trim() : ya[2].trim();
+  if (/number/i.test(q)) return /10/.test(q) ? '7' : '3'; if (/color/i.test(q)) return 'neela';
+  if (/jaipur|rajasthan/i.test(q)) return 'dal baati'; if (/star/i.test(q)) return 'shahrukh'; if (/ipl/i.test(q)) return 'csk'; if (/shah rukh/i.test(q)) return 'ddlj'; if (/hrithik/i.test(q)) return 'krrish'; if (/ranbir/i.test(q)) return 'animal'; if (/web series/i.test(q)) return 'mirzapur'; if (/weekend/i.test(q)) return 'sona'; if (/sabzi/i.test(q)) return 'karela';
+  return 'chai';
+}
+function botPairAnswer(q) { const k = Object.keys(BOT_PAIR).find(k => q.toLowerCase().includes(k)); return k ? rnd(BOT_PAIR[k]) : 'aam'; }
+function botTick(room) {
+  const al = alive(room); const ph = room.phase; const pd = room.pd; const key = ph + ':' + (room.deadline || 0) + ':' + room.round;
+  for (const b of bots(room)) {
+    if (ph === 'ROLES') { if (!b.ready) botDelay(room, key, b, 1500 + Math.random() * 2500, () => doReady(room, b.id)); continue; }
+    if (!b.alive) continue;
+    const others = al.filter(p => p.id !== b.id); const innocents = al.filter(p => p.role !== 'traitor');
+    if (ph === 'MISSION') {
+      const t = pd.type; const left = Math.max(1000, (room.deadline || now()) - now()) / TIMESCALE;
+      if (t === 'dhokha' && pd.subs[b.id] === undefined) botDelay(room, key, b, 3000 + Math.random() * 12000, () => missionSubmit(room, b.id, Math.random() < (b.role === 'traitor' ? 0.6 : 0.88) ? 'saath' : 'dhokha'));
+      else if (t === 'sync' && pd.subs[b.id] === undefined) botDelay(room, key, b, 4000 + Math.random() * 15000, () => missionSubmit(room, b.id, botSyncAnswer(pd.question || '')));
+      else if (t === 'race' && pd.subs[b.id] === undefined) botDelay(room, key, b, 12000 + Math.random() * 6000, () => missionSubmit(room, b.id, 5 + Math.floor(Math.random() * 6)));
+      else if (t === 'math' && pd.subs[b.id] === undefined) botDelay(room, key, b, 25000 + Math.random() * 10000, () => { const arr = pd.probs.map(pr => Math.random() < 0.35 ? pr.a : null); missionSubmit(room, b.id, arr); });
+      else if (t === 'memory' && pd.subs[b.id] === undefined) botDelay(room, key, b, 10000 + Math.random() * 15000, () => { const k = 2 + Math.floor(Math.random() * 5); const arr = pd.seq.map((e, i) => i < k ? e : rnd(pd.pad || EMO)); missionSubmit(room, b.id, arr); });
+      else if (t === 'pairs' && pd.subs[b.id] === undefined) { const pr = pd.pairs.find(x => x.ids.includes(b.id)); botDelay(room, key, b, 5000 + Math.random() * 12000, () => missionSubmit(room, b.id, botPairAnswer(pr ? pr.q : ''))); }
+      else if (t === 'kadi' && pd.step === 1 && pd.subs[b.id] === undefined) botDelay(room, key, b, 4000 + Math.random() * 10000, () => { const s = botSuspect(room, b, others); if (s) missionSubmit(room, b.id, s.id); });
+      else if (t === 'kadi' && pd.step === 2 && pd.kadi === b.id && !pd.guess) botDelay(room, key, b, 5000, () => missionSubmit(room, b.id, rnd(others).id));
+      else if (t === 'puzzle') {
+        const g = groupOf(room, b.id);
+        if (g && !pd.solved[g]) {
+          botDelay(room, key + ':hint', b, 8000 + Math.random() * 20000, () => { if (pd.solved[g]) return; pd.gchat[g].push({ t: now(), pid: b.id, name: b.name, text: rnd(['Hmm... socho, ye kuch aur hai.', 'Mujhe lagta hai jawab chhota sa hai.', 'Kisi ko idea hai? Main try karta hoon.', 'Ek baar ulta padh ke dekho.', 'Shayad yeh trick question hai.']) }); push(room); });
+          if (Math.random() < 0.5) botDelay(room, key + ':solve', b, Math.min(left * 0.9, 35000 + Math.random() * 40000), () => { if (!pd.solved[g]) { pd.gchat[g].push({ t: now(), pid: b.id, name: b.name, text: 'Ruko — mil gaya, try karta hoon!' }); missionSubmit(room, b.id, pd.puz[g].a[0]); } });
+          else botDelay(room, key + ':solve', b, 1, () => {});
+        }
+      }
+      else if ((t === 'twister' || t === 'chup') && pd.step === 2 && pd.subs2 && pd.subs2[b.id] === undefined) botDelay(room, key, b, 3000 + Math.random() * 8000, () => { const hum = others.filter(p => !p.bot); const pick = hum.length && Math.random() < 0.3 ? rnd(hum).id : null; missionSubmit(room, b.id, t === 'twister' ? (pick ? [pick] : []) : (pick || 'none')); });
+      if (pd.saboteur === b.id && !pd.sabotaged && Math.random() < 0.3) botDelay(room, key + ':sab', b, 5000, () => { if (room.phase === 'MISSION') { pd.sabotaged = true; push(room); } });
+    }
+    else if (ph === 'TABLE') {
+      const m = mind(room, b);
+      botDelay(room, key + ':c1', b, 6000 + Math.random() * 45000, () => { const s = botSuspect(room, b, others); if (!s) return; room.chat.push({ t: now(), name: b.name, pid: b.id, text: rnd(BOT_TABLE).replace('{X}', s.name).replace('{R}', rnd(BOT_REASONS)) }); push(room); });
+      const mentioned = room.chat.slice(-6).some(c => c.pid !== b.id && !c.sys && c.text && c.text.toLowerCase().includes(b.name.toLowerCase()));
+      if (mentioned && m.chatted < 2) { m.chatted++; botDelay(room, key + ':d' + m.chatted, b, 4000 + Math.random() * 6000, () => { room.chat.push({ t: now(), name: b.name, pid: b.id, text: rnd(BOT_DEFEND) }); push(room); }); }
+      if (pd.card === 'lie' && pd.liar === b.id && !pd.lieText) botDelay(room, key + ':lie', b, 8000, () => { pd.lieText = 'Main kal raat Turret mein nahi tha.'; push(room); });
+    }
+    else if (ph === 'VOTE') {
+      if (pd.voters.includes(b.id) && !pd.votes[b.id]) botDelay(room, key, b, 4000 + Math.random() * 14000, () => { const c = al.filter(p => pd.cands.includes(p.id)); const s = botSuspect(room, b, c); if (s) castVote(room, b.id, s.id, rnd(BOT_REASONS)); });
+    }
+    else if (ph === 'BANISH' && pd.current === b.id) {
+      if (!pd.revealed) botDelay(room, key + ':flip', b, 4000, () => flipCard(room, b.id));
+      else if (pd.antim && !pd.suspect) botDelay(room, key + ':antim', b, 3000 + Math.random() * 4000, () => { const s = botSuspect(room, b, others); if (s) antim(room, b.id, s.id); });
+    }
+    else if (ph === 'END_CHOICE' && !pd.votes[b.id]) {
+      botDelay(room, key, b, 4000 + Math.random() * 10000, () => { const tb = room.banishedList.filter(x => x.role === 'traitor').length; const v = b.role === 'traitor' ? 'end' : (tb >= 2 || Math.random() < 0.3 ? 'end' : 'more'); doEndChoice(room, b.id, v); });
+    }
+    else if (ph === 'NIGHT' && b.role === 'traitor' && !pd.tprop[b.id]) {
+      botDelay(room, key, b, 8000 + Math.random() * 20000, () => {
+        const other = traitors(room).find(t => t.id !== b.id && pd.tprop[t.id]);
+        let prop;
+        if (other) prop = pd.tprop[other.id];
+        else { const s = pubSus(room); const targets = innocents.filter(p => p.alive); if (!targets.length) return; const sorted = [...targets].sort((x, y) => ((s[x.id] || 0) + (x.bot ? 0.8 : 0)) - ((s[y.id] || 0) + (y.bot ? 0.8 : 0))); const target = Math.random() < 0.7 ? sorted[0] : rnd(targets); prop = { action: pd.canRecruit && Math.random() < 0.45 ? 'recruit' : 'murder', target: target.id }; }
+        room.tchat.push({ t: now(), name: b.name, text: other ? 'Theek hai, main agree.' : rnd(BOT_TURRET) });
+        traitorPropose(room, b.id, prop.action, prop.target);
+      });
+    }
+    else if (ph === 'RECRUIT' && pd.target === b.id && !pd.answered) botDelay(room, key, b, 5000 + Math.random() * 8000, () => recruitAnswer(room, b.id, Math.random() < 0.6));
+    else if (ph === 'SHARE_STEAL' && pd.traitorIds && pd.traitorIds.includes(b.id) && !pd.choices[b.id]) botDelay(room, key, b, 5000 + Math.random() * 10000, () => doShareSteal(room, b.id, Math.random() < 0.55 ? 'steal' : 'share'));
+  }
+}
+
 function narrate(room, text, kind = 'narr') { log(room, text, kind); }
 
 // ---------- game flow ----------
@@ -298,13 +416,13 @@ function startMission(room) {
   if (type === 'sync') { room.pd.question = pickFresh(room, 'sync', SYNC_Q, 1)[0]; }
   if (type === 'race') { ms = 22000; }
   if (type === 'chup') {
-    const lines = pickFresh(room, 'chup', [...CHUP_LINES, ...(room.settings.adult ? ADULT_EXTRA : [])], al.length);
-    room.pd.lines = {}; al.forEach((p, i) => room.pd.lines[p.id] = lines[i % lines.length]);
+    const lines = pickFresh(room, 'chup', [...CHUP_LINES, ...(room.settings.adult ? ADULT_EXTRA : [])], al.filter(p => !p.bot).length || 1);
+    room.pd.lines = {}; al.filter(p => !p.bot).forEach((p, i) => room.pd.lines[p.id] = lines[i % lines.length]);
     ms = 50000;
   }
   if (type === 'twister') {
     const tw = pickFresh(room, 'twister', TWISTERS, al.length);
-    room.pd.lines = {}; room.pd.order = shuffle(al.map(p => p.id)); room.pd.order.forEach((id, i) => room.pd.lines[id] = tw[i % tw.length]);
+    room.pd.lines = {}; room.pd.order = shuffle(al.filter(p => !p.bot).map(p => p.id)); room.pd.order.forEach((id, i) => room.pd.lines[id] = tw[i % tw.length]);
     ms = Math.min(120000, 15000 * al.length);
   }
   if (type === 'puzzle') {
@@ -430,13 +548,13 @@ function resolveMission(room) {
   }
   else if (pd.type === 'twister') {
     const tally = {}; al.forEach(p => { (pd.subs2 && pd.subs2[p.id] || []).forEach(v => tally[v] = (tally[v] || 0) + 1); });
-    const need = Math.ceil(al.length / 2);
-    const fumbled = al.filter(p => (tally[p.id] || 0) >= need).map(p => p.id);
-    const clean = al.filter(p => !tally[p.id]).map(p => p.id);
+    const need = Math.ceil(al.length / 2); const hum = al.filter(p => !p.bot);
+    const fumbled = hum.filter(p => (tally[p.id] || 0) >= need).map(p => p.id);
+    const clean = hum.filter(p => !tally[p.id]).map(p => p.id);
     pd.fumbled = fumbled; pd.scores = {}; al.forEach(p => pd.scores[p.id] = tally[p.id] || 0);
-    win = fumbled.length <= Math.floor(al.length / 3);
-    let shieldTo = null; if (win && clean.length && clean.length < al.length) { shieldTo = rnd(clean); room.players[shieldTo].shield = true; pd.shieldPublic = shieldTo; }
-    detail = (fumbled.length ? `Zubaan ladkhadayi: ${fumbled.map(id => pname(room, id)).join(', ')}. ` : 'Kisi ki zubaan nahi ladkhadayi! ') + (win ? 'Mission successful.' : `${fumbled.length} log atke — ${Math.floor(al.length / 3)} tak chalta. Mission fail.`) + (shieldTo ? ` ${pname(room, shieldTo)} ko ek bhi vote nahi mila — Shield.` : '');
+    win = fumbled.length <= Math.floor(hum.length / 3);
+    let shieldTo = null; if (win && clean.length && clean.length < hum.length) { shieldTo = rnd(clean); room.players[shieldTo].shield = true; pd.shieldPublic = shieldTo; }
+    detail = (fumbled.length ? `Zubaan ladkhadayi: ${fumbled.map(id => pname(room, id)).join(', ')}. ` : 'Kisi ki zubaan nahi ladkhadayi! ') + (win ? 'Mission successful.' : `${fumbled.length} log atke — ${Math.floor(hum.length / 3)} tak chalta. Mission fail.`) + (shieldTo ? ` ${pname(room, shieldTo)} ko ek bhi vote nahi mila — Shield.` : '');
   }
   else if (pd.type === 'puzzle') {
     const nA = !!pd.solved.A, nB = !!pd.solved.B;
@@ -770,7 +888,8 @@ io.on('connection', (socket) => {
   socket.on('settings', (s) => { const r = room(); if (!r || ctx.pid !== r.hostId || r.phase !== 'LOBBY') return; if (typeof s.stake === 'number') r.settings.stake = Math.max(0, Math.min(MAX_STAKE, Math.round(s.stake))); if (typeof s.adult === 'boolean') r.settings.adult = s.adult; if (typeof s.masala === 'boolean') r.settings.masala = s.masala; push(r); });
   socket.on('kick', (id) => { const r = room(); if (!r || ctx.pid !== r.hostId || r.phase !== 'LOBBY' || id === r.hostId) return; const p = r.players[id]; if (p && p.socketId) io.to(p.socketId).emit('kicked'); delete r.players[id]; r.order = r.order.filter(x => x !== id); push(r); });
   socket.on('start', () => { const r = room(); if (!r || ctx.pid !== r.hostId || r.phase !== 'LOBBY') return; startGame(r); });
-  socket.on('ready', () => { const r = room(); if (!r || r.phase !== 'ROLES') return; const p = r.players[ctx.pid]; if (!p) return; p.ready = true; if (allReady(r)) startMission(r); else push(r); });
+  socket.on('ready', () => { const r = room(); if (r) doReady(r, ctx.pid); });
+  socket.on('addBots', () => { const r = room(); if (!r || ctx.pid !== r.hostId || r.phase !== 'LOBBY') return; addBots(r); });
   socket.on('mission', (val, cb) => { const r = room(); if (!r) return; const res = missionSubmit(r, ctx.pid, val); if (typeof cb === 'function') cb(res || {}); });
   socket.on('gchat', (text) => { const r = room(); if (!r || r.phase !== 'MISSION' || r.pd.type !== 'puzzle') return; const p = r.players[ctx.pid]; if (!p || !p.alive) return; const g = groupOf(r, ctx.pid); if (!g) return; text = (text || '').toString().slice(0, 160).trim(); if (!text) return; r.pd.gchat[g].push({ t: now(), name: p.name, pid: p.id, text }); push(r); });
   socket.on('sabotage', () => { const r = room(); if (!r || r.phase !== 'MISSION' || r.pd.saboteur !== ctx.pid) return; r.pd.sabotaged = true; push(r); });
@@ -790,10 +909,10 @@ io.on('connection', (socket) => {
   socket.on('vote', ({ target, reason }) => { const r = room(); if (r) castVote(r, ctx.pid, target, reason); });
   socket.on('flip', () => { const r = room(); if (r) flipCard(r, ctx.pid); });
   socket.on('antim', (target) => { const r = room(); if (r) antim(r, ctx.pid, target); });
-  socket.on('endChoice', (v) => { const r = room(); if (!r || r.phase !== 'END_CHOICE') return; const p = r.players[ctx.pid]; if (!p || !p.alive) return; r.pd.votes[ctx.pid] = v === 'end' ? 'end' : 'more'; if (Object.keys(r.pd.votes).length >= alive(r).length) resolveEndChoice(r); else push(r); });
+  socket.on('endChoice', (v) => { const r = room(); if (r) doEndChoice(r, ctx.pid, v); });
   socket.on('night', ({ action, target }) => { const r = room(); if (r) traitorPropose(r, ctx.pid, action, target); });
   socket.on('recruit', (yes) => { const r = room(); if (r) recruitAnswer(r, ctx.pid, !!yes); });
-  socket.on('shareSteal', (c) => { const r = room(); if (!r || r.phase !== 'SHARE_STEAL') return; if (!r.pd.traitorIds.includes(ctx.pid)) return; r.pd.choices[ctx.pid] = c === 'steal' ? 'steal' : 'share'; if (Object.keys(r.pd.choices).length >= r.pd.traitorIds.length) finalize(r); else push(r); });
+  socket.on('shareSteal', (c) => { const r = room(); if (r) doShareSteal(r, ctx.pid, c); });
   socket.on('again', () => { const r = room(); if (!r || ctx.pid !== r.hostId || r.phase !== 'FINAL') return; r.phase = 'LOBBY'; r.pd = {}; r.order.forEach(id => { const p = r.players[id]; p.alive = true; p.role = null; p.shield = false; p.poisoned = false; p.ready = false; p.recruited = false; }); r.chat = []; r.log = []; r.finalResult = null; push(r); });
   socket.on('leave', () => { const r = room(); if (!r) return; if (r.phase === 'LOBBY' && ctx.pid !== r.hostId) { delete r.players[ctx.pid]; r.order = r.order.filter(x => x !== ctx.pid); push(r); } ctx = { code: null, pid: null }; });
   socket.on('disconnect', () => { const r = room(); if (!r) return; const p = r.players[ctx.pid]; if (p) { p.connected = false; p.socketId = null; } push(r); });
